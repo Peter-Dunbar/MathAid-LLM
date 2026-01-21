@@ -1,0 +1,109 @@
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+import torch
+import os
+
+#More examples other then simply '2+3?'
+test_questions = [
+    "What is 2 + 3?",
+    "What does 15 - 7 = ?",
+    "Solve: 4 * 6 = ?",
+    "If John has 5 apples and buys 3 more, how many apples does he have?"
+]
+
+###############Set up trained model for prompting###############
+checkpoint_dir = "./tinyllama-math"
+if os.path.exists(f"{checkpoint_dir}/final_model"):
+    checkpoint_path = f"{checkpoint_dir}/final_model"
+    print(f"Using final model")
+else:
+    # Find latest checkpoint
+    checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("checkpoint-")]
+    if checkpoints:
+        checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+        checkpoint_path = f"{checkpoint_dir}/{checkpoints[-1]}"
+        print(f"Using {checkpoints[-1]}")
+    else:
+        checkpoint_path = f"{checkpoint_dir}/checkpoint-800"
+        print(f"Using checkpoint-800")
+
+base_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+# CHANGED: Load in FP16 for Colab compatibility
+base_model = AutoModelForCausalLM.from_pretrained(
+    base_model_name,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+)
+model = PeftModel.from_pretrained(base_model, checkpoint_path)
+
+device = 0 if torch.cuda.is_available() else -1
+if device >= 0:
+    model = model.to('cuda')
+else:
+    model = model.to('cpu')
+
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    device=device
+)
+
+def cumulative_reasoning(pipe, question, max_steps=5):
+    verified_steps = []
+
+    print(f"Question: {question}")
+
+    for i in range(max_steps):
+        steps_text = "\n".join([f"{j+1}. {s}" for j, s in enumerate(verified_steps)])
+        if steps_text:
+            prompt = f"{question}\nVerified steps:\n{steps_text}\nNext step:"
+        else:
+            prompt = f"{question}\nFirst step:"
+
+        step = pipe(prompt, max_new_tokens=60, do_sample=True, temperature=0.6)[0]['generated_text']
+
+        #Take each step and print out
+        if "Next step:" in step:
+            step = step.split("Next step:")[-1].strip()
+        elif "First step:" in step:
+            step = step.split("First step:")[-1].strip()
+        else:
+            step = step.strip()
+
+        #take only the first line
+        step = step.split('\n')[0].strip()
+        print(f"  Step {i+1}: {step}")
+
+        verified_steps.append(step)
+
+    #Gets our final answer
+    if verified_steps:
+        steps_text = "\n".join([f"{j+1}. {s}" for j, s in enumerate(verified_steps)])
+        final_prompt = f"{question}\nSteps:\n{steps_text}\nFinal numerical answer:"
+    else:
+        final_prompt = f"{question}\nDirect answer:"
+
+    answer = pipe(final_prompt, max_new_tokens=30, temperature=0.3)[0]['generated_text']
+
+    #Extract answer
+    if "answer:" in answer.lower():
+        answer = answer.split("answer:")[-1].strip()
+
+    #get final answer
+    import re
+    numbers = re.findall(r'\d+', answer)
+    if numbers:
+        final_answer = numbers[0]
+    else:
+        final_answer = answer.split('\n')[0].strip()[:50]
+
+    print(f"\n  Final Answer: {final_answer}")
+    print()
+
+    return final_answer
+
+# Test with detailed output
+for q in test_questions:
+    cumulative_reasoning(pipe, q)
