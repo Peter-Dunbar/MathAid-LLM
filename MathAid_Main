@@ -1,0 +1,123 @@
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from peft import LoraConfig, get_peft_model
+import torch
+import gc
+
+gc.collect()
+torch.cuda.empty_cache()
+
+##############Grabing Dataset ####################
+#Using MathScale database
+dataset = load_dataset("fdqerq22ds/MathScaleQA-2M")
+print(dataset)
+
+#Only want a smaller amount of the dataset as to decrease training time
+dataset['train'] = dataset['train'].select(range(5000)) #Set it to only be 5k change as wanted
+
+#Have to alter the dataset to fit my tokenization
+def formatExamples(example):
+  return{
+      "prompt": example['prompt'],
+      "completion": example['completion']
+  }
+dataset = dataset.map(formatExamples)
+
+##############Grabing TinyLlama#################
+model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+
+##############LoRA Wrapper#################
+config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, config)
+model.enable_input_require_grads()
+
+##############Tokenization#################
+def tokenize(batch):
+    combinedTexts = [
+        f"{prompt}\n{completion}<|endoftext|>"
+        for prompt, completion in zip(batch["prompt"], batch["completion"])
+    ]
+
+    result = tokenizer(
+        combinedTexts,
+        truncation=True,
+        padding="max_length",
+        max_length=512,
+        return_attention_mask=True
+    )
+
+    result["labels"] = [seq.copy() for seq in result["input_ids"]]
+    return result
+
+tokenized_dataset = dataset.map(
+    tokenize,
+    batched=True,
+    remove_columns=dataset["train"].column_names
+)
+
+
+##############Training parameters#################
+training_args = TrainingArguments(
+    output_dir="./tinyllama-math",
+    eval_strategy="steps",
+    save_strategy="steps",
+    save_steps=200,                           #Using steps of 200 to save on runtime
+    eval_steps=200,
+    logging_steps=50,
+    per_device_train_batch_size=4,            #Was recommended to add for faster processing on Colab
+    per_device_eval_batch_size=4,              #Was recommended to add for faster processing on Colab
+    gradient_accumulation_steps=1,
+    num_train_epochs=3,                       #Lowered epochs due to increase of data
+    learning_rate=5e-4,                       #Kept learning rate due to increase of data
+    fp16=True,
+    gradient_checkpointing=True,  #Was recommended to add for saving memory on Colab
+    optim="adamw_torch",
+    report_to="none",
+    save_total_limit=2,  #will only keep the top 2 checkpoints
+    dataloader_num_workers=2,  #Was recommended to add for faster processing on Colab
+)
+
+dataCollator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False
+)
+
+#Doing a (90/10) train/eval split
+train_size = int(0.9 * len(tokenized_dataset["train"]))
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset["train"].select(range(train_size)),
+    eval_dataset=tokenized_dataset["train"].select(range(train_size, len(tokenized_dataset["train"]))),
+    data_collator=dataCollator,
+)
+
+##############Start training#################
+trainer.train()
+trainer.save_model("./tinyllama-math/final_model") #saving the last model
+
+#Clean up memory
+#Was recommended to add for saving memory on Colab
+del model
+del trainer
+gc.collect()
+torch.cuda.empty_cache()
